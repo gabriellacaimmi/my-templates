@@ -1,0 +1,361 @@
+---
+title: "Trial Roll on Analysis"
+subtitle: ""
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+author:
+    - name: 'Gabbi Caimmi'
+output:
+  html_document:
+    df_print: paged
+    code_folding: hide
+---
+
+```{css, echo=FALSE}
+pre {
+max-height: 300px;
+overflow-y: auto;
+}
+pre[class] {
+max-height: 300px;
+}
+```
+
+```{css, echo=FALSE}
+.scroll-300 {
+  max-height: 300px;
+  overflow-y: auto;
+  background-color: inherit;
+}
+```
+
+
+```{r call packages, echo = FALSE, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(ftbbqr)
+library(dbplyr)
+library(rmarkdown)
+```
+
+## The initiative
+### Offering Standard Annual/Monthly and Premium Annual renewals for to prospect trialists
+In a previous test from 2015, we tried offering Standard Trial in place of Premium Trials. Standard trials gained a 12% increase in volume. The 12% increase wasn't enough to make up for the lower revenue gained from Standard Trials.  
+We have a known subscriber dilemma where users who are not ready to sign up to a full-priced subscription must sacrifice a £1 month to sign up directly. If they choose a trial to gain the £1 month, they later have to manually cancel or change to the subscription type that they want if it isn't Premium monthly, an expensive option that is less popular.
+
+### Hypothesis
+“ If we allow users to pick their own roll on term and subscription type then this will lead to an increase in volume for trials and retention of those trials.  If we leave Premium Digital monthly as the default then we will keep our revenue intact.  If we allow annual trials then we will increase revenue generated from trials in some cases.”
+
+```{r, echo = FALSE,message=FALSE, warning=FALSE}
+con <- ftdata_connection() 
+billing <- "ft-customer-analytics"
+```
+
+```{r, echo = FALSE,message=FALSE, warning=FALSE}
+optimizely <- tbl(con, "ft-data.spoor.optimizely")
+conversions <- tbl(con, "ft-bi-team.BI_Layer_Integration.conversion_visit")
+pageview <- tbl(con, "ft-bi-team.BI_Layer_Integration.pageview")
+kuds <- tbl(con, "ft-bi-team.BI_Layer_Integration.known_user_daily_status")
+```
+
+## Analysis
+
+The experiment lasted for 30 days, during which it accrued about 50k visitors, among anonymous and registered, initiating the trial buy flow.
+We count around 3k b2c conversions per test group, resulting in a 13% conversion rate for control and 12.8% conversion rate for variant. The relative difference between variant and control conversion rate is 1.5%.
+
+```{r, message = FALSE, warning = FALSE}
+start_date <- as.Date("2023-08-04")
+end_date <- as.Date("2023-09-04")
+
+  #can also use as.Date(.data$`_PARTITIONTIME`) in the filter clause for the optimizely table to filter the partitioning
+
+joined_df <- pageview %>%
+  filter(time_stamp_utc <= end_date, 
+         time_stamp_utc >= start_date) %>%
+  inner_join(optimizely %>%
+               partitiontime_between(start_date, end_date) %>%
+               filter(optimizely_campaign_name == 'MVT-400: Trial Roll on Test')
+               , by = "event_root_id",suffix = c("_pvs", "_opt")) %>%
+  left_join(conversions %>% filter(is_b2c == TRUE), by = "visitor_id", suffix = c("_pvs", "_cv")) %>%
+  filter( is.na(order_dtm) | order_dtm >= time_stamp_utc) %>%
+  mutate(visitor_id = as.character(visitor_id),
+         visit_id = as.character(visit_id),
+         cancelled_same_day= as.character(cancelled_same_day),
+         conversion_visit_id = as.character(conversion_visit_id)) %>%
+  collect()
+
+  
+  df_filtered <- joined_df %>% select(event_id_pvs, event_root_id, time_day, time_stamp_utc, visit_id,
+         visitor_id, user_guid_pvs, user_cohort, url_pvs, traffic_source_type_pvs, rollup_traffic_source_type,
+         device_type_pvs, optimizely_campaign_name, optimizely_variations_name,
+         user_guid_cv,subscriptionid,product_type, order_dtm, conversion_visit_id, subscription_start_dtm,cancelled_same_day,
+         is_trial, is_b2c, main_product_name, arrangementproduct_name, arrangement_id, arrangementtype_name, number_of_periods,offer_id, user_guid_cv) %>%
+    group_by(visitor_id) %>%
+    mutate(count = n_distinct(optimizely_variations_name)) %>% ungroup() %>% arrange(desc(count)) %>% filter(count == 1)
+
+# running checks on manipulation
+df_filtered %>%
+  group_by(optimizely_variations_name) %>%
+  summarise(count_visitors = n_distinct(visitor_id),
+            count_events = n_distinct(event_root_id), 
+            count_conversions = n_distinct(user_guid_cv),
+            conversion_rate = round((count_conversions/count_visitors)*100, 1)) %>%
+  arrange()
+```
+
+```{r, message = FALSE, warning = FALSE}
+df_filtered %>%
+  group_by(optimizely_variations_name, time_day) %>%
+  summarise(count = n_distinct(visitor_id)) %>%
+  ungroup() %>%
+  arrange(optimizely_variations_name, time_day) %>%
+  ggplot(aes(time_day, count, color = optimizely_variations_name)) +
+  geom_line() +
+  labs(title = "Visitors over time by group",
+       x = "day",
+       y = "count of visitors",
+       color = "test_group")
+```
+
+```{r, message = FALSE, warning = FALSE}
+df_filtered %>%
+  group_by(optimizely_variations_name, visitor_id) %>% slice(which.min(time_day)) %>% 
+  ungroup() %>%
+  group_by(optimizely_variations_name, user_cohort) %>%
+  summarise(visitors = n_distinct(visitor_id)) %>% 
+  ungroup() %>%
+  filter(user_cohort != 'weekend') %>%
+  ggplot(aes(optimizely_variations_name, visitors, fill = user_cohort)) +
+  geom_col() +
+  labs(x = element_blank(),
+       title = "Visitors by user cohort",
+       subtitle = "Most of the traffic in both groups is anonymous (80%).") +
+  geom_text(aes(label = visitors))
+```
+
+
+
+```{r, message = FALSE, warning = FALSE}
+
+df_filtered %>%
+  group_by(optimizely_variations_name, time_day) %>%
+  summarise(visitors = n_distinct(visitor_id),
+            conversions = n_distinct(user_guid_cv)) %>%
+  mutate(conversion_rate = conversions/visitors) %>%
+  ungroup() %>%
+  ggplot(aes(time_day, conversion_rate, color = optimizely_variations_name)) +
+  geom_line()  +
+  labs(title = "B2C Conversion Rate over time by group",
+       subtitle = "Control and Variant conversion rates overlap substantially",
+       x = "day",
+       y = "conversion rate",
+       color = "test_group")
+```
+
+
+Below is the split of trials among the 4 different roll-on options made available in variant group. 97% of conversions continued being taken with a Premium monthly roll on, the default option. Only 2% of prospects actively decided to switch onto a Standard roll on. Ultimately, very few users (10) decided to switch to an annual roll on, that would equal to 0.7 trial with annual roll on conversions per day. 
+
+
+```{r, message = FALSE, warning = FALSE}
+#total trial conversions split by term
+trial_product_list <- df_filtered %>%
+  distinct(optimizely_variations_name, visitor_id, arrangementtype_name, product_type, arrangementproduct_name, user_guid_cv, offer_id) %>%
+  mutate(conversion_type = ifelse(product_type == "Digital" & arrangementtype_name == "B2C Trial" 
+                           & (arrangementproduct_name == "Premium FT.com" | arrangementproduct_name == "Standard FT.com"), "Digital Trial", 
+                           ifelse(!is.na(user_guid_cv), "Other Conversion", "No Conversion")
+                           ),
+         trial_name = ifelse(offer_id == "41218b9e-c8ae-c934-43ad-71b13fcb4465", "Premium Monthly"
+                             , ifelse(offer_id == "03e5369b-783f-2f22-94d0-567e9dd95b56", "Standard Monthly"
+                                      ,ifelse(offer_id == "0916a7ac-c7d9-6444-4278-0b98272d30a9", "Premium Annual", "Standard Annual")))
+         ) %>%
+  filter(conversion_type == "Digital Trial", offer_id != "Unknown")
+ 
+trial_product <- trial_product_list %>% group_by(optimizely_variations_name, trial_name) %>%
+  summarise(conversions = n_distinct(user_guid_cv)
+            ) %>%
+  ungroup() %>%
+  filter(optimizely_variations_name == "Variation_1") %>%
+  mutate(perc_total = round(conversions/(sum(conversions))*100,2)) %>%
+  select(optimizely_variations_name, trial_name, conversions, perc_total) %>% arrange(desc(conversions))
+
+trial_product
+```
+
+Below is an overview of B2C conversions and conversion rate split by product type. All in all everything looks rather flat. We can see a slight decline in non trial conversion rate (-11%) driven by the fact that we purposely removed any backward journey (from the trial buy flow back to product selection) in variant group. However, volumes and rates would be too small to uncover any significant finding from this. 
+
+```{r, message = FALSE, warning = FALSE}
+#total conversions split by product
+df_filtered %>%
+  distinct(optimizely_variations_name, visitor_id, arrangementtype_name, product_type, arrangementproduct_name, user_guid_cv, offer_id) %>%
+  mutate(conversion_type = ifelse(product_type == "Digital" & arrangementtype_name == "B2C Trial" 
+                           & (arrangementproduct_name == "Premium FT.com" | arrangementproduct_name == "Standard FT.com"), "Digital Trial", 
+                           ifelse(!is.na(user_guid_cv), "Other Conversion", "No Conversion")
+                           )) %>%
+  group_by(optimizely_variations_name, conversion_type) %>%
+  summarise(conversions = n_distinct(user_guid_cv)) %>%
+  filter(!is.na(conversion_type)) %>%
+  ggplot(aes(optimizely_variations_name, conversions, fill = conversion_type)) +
+  geom_col(position = "dodge") +
+  labs(title = "Conversions by conversion_type",
+       x = element_blank()) +
+  geom_text(aes(label = conversions), position=position_dodge(width=1))
+```
+
+```{r, message = FALSE, warning = FALSE}
+#conversion rate split by product
+df_filtered %>%
+  distinct(optimizely_variations_name, visitor_id, arrangementtype_name, product_type, arrangementproduct_name, user_guid_cv) %>%
+  mutate(conversion_type = ifelse(product_type == "Digital" & arrangementtype_name == "B2C Trial" 
+                           & (arrangementproduct_name == "Premium FT.com" | arrangementproduct_name == "Standard FT.com"), "Digital Trial", 
+                           ifelse(!is.na(user_guid_cv), "Other Conversion", "No Conversion")
+                           )) %>%
+  group_by(optimizely_variations_name) %>%
+  mutate(visitors = n_distinct(visitor_id)) %>% ungroup() %>%
+  group_by(optimizely_variations_name, conversion_type) %>%
+  mutate(conversions_by_type = n_distinct(user_guid_cv)) %>% ungroup() %>%
+  distinct(optimizely_variations_name, conversion_type, visitors, conversions_by_type) %>%
+  filter(!is.na(conversion_type)) %>%
+  arrange(optimizely_variations_name,conversion_type) %>%
+  mutate(cvr = round(conversions_by_type/visitors,4)*100) %>%
+  ggplot(aes(optimizely_variations_name, cvr, fill = conversion_type)) +
+  geom_col(position = 'dodge') +
+  labs(title = "Conversion rate by conversion_type",
+       x = element_blank()) +
+  geom_text(aes(label = cvr), position=position_dodge(width=1))
+```
+
+Indeed when calculating p-values for overall b2c conversion rate and trial-only conversion rate, we can't conclude any significant shift among conversion metrics.
+
+```{r, message = FALSE, warning = FALSE}
+#significance analysis for conversion rates
+df_filtered_significance <- df_filtered %>%
+distinct(optimizely_variations_name, visitor_id,user_guid_cv) %>% 
+mutate(conversion = ifelse(is.na(user_guid_cv), 0, 1)) 
+
+
+df_filtered_significance_trial <- df_filtered %>%
+distinct(optimizely_variations_name, visitor_id, user_guid_cv, arrangementtype_name, product_type, arrangementproduct_name) %>%
+mutate(conversion = ifelse(product_type == "Digital" & arrangementtype_name == "B2C Trial" 
+                           & (arrangementproduct_name == "Premium FT.com" | arrangementproduct_name == "Standard FT.com"), 1, 0)) %>%
+distinct(optimizely_variations_name, visitor_id,user_guid_cv, conversion)
+
+significance_results <- t.test(conversion ~ optimizely_variations_name, mu = 0 , alt= "two.sided", conf=0.95, var.eq=F, paired=F, data = df_filtered_significance)
+
+significance_results_trial <- t.test(conversion ~ optimizely_variations_name, mu = 0 , alt= "two.sided", conf=0.95, var.eq=F, paired=F, data = df_filtered_significance_trial)
+
+p_values <- c(round(significance_results$p.value,2), round(significance_results_trial$p.value,2))
+
+p_values
+```
+
+Renewal rates (from a trial to a subscription) look alike among test groups with about 45% of trialists deciding to renew onto a full price subscription.
+
+```{r, message = FALSE, warning = FALSE}
+#renewal rates
+
+renewal_joined_df <- pageview %>%
+  filter(time_stamp_utc <= end_date, 
+         time_stamp_utc >= start_date) %>%
+  inner_join(optimizely %>%
+               partitiontime_between(start_date, end_date) %>%
+               filter(optimizely_campaign_name == 'MVT-400: Trial Roll on Test')
+               , by = "event_root_id",suffix = c("_pvs", "_opt")) %>%
+  left_join(conversions %>% filter(is_b2c == TRUE), by = "visitor_id", suffix = c("_pvs", "_cv")) %>%
+  filter( is.na(order_dtm) | order_dtm >= time_stamp_utc) %>%
+  mutate(visitor_id = as.character(visitor_id),
+         visit_id = as.character(visit_id),
+         conversion_visit_id = as.character(conversion_visit_id)) %>%
+  distinct(optimizely_variations_name, user_guid_cv, order_dtm, arrangementtype_name, product_type, arrangementproduct_name, arrangement_id) %>% 
+  left_join(kuds %>% mutate(user_guid_cv = user_guid) %>% filter(user_status_date >= start_date, product_start_date >= start_date), by = "user_guid_cv") %>%
+  collect()
+
+renewal_joined_filtered_df <- renewal_joined_df %>% 
+  group_by(user_guid) %>%
+    mutate(count = n_distinct(optimizely_variations_name)) %>% ungroup() %>% arrange(desc(count)) %>% filter(count == 1) %>%
+  distinct(optimizely_variations_name, user_guid, order_dtm, user_status_date, product_type_y,
+           product_name_rollup, product_arrangement_type, product_status, product_start_date,b2c_product_term_rollup, b2c_product_name_and_term,b2c_days_until_renewal, b2c_payment_failures, behav_has_cancelled) %>% filter(product_type_y != '') %>%
+  arrange(user_guid, user_status_date) 
+
+  
+renewal_list <- renewal_joined_filtered_df %>%distinct(optimizely_variations_name, user_guid, product_start_date, product_arrangement_type) %>% arrange(user_guid, product_start_date) %>%
+  group_by(user_guid) %>% # it's the group by that works for partitioning
+  mutate(next_product = lead(product_arrangement_type, order_by = product_start_date ,n = 1, default = NA)) %>%
+  filter(product_arrangement_type %in% ("B2C Trial")) %>%
+  mutate(count = n()) %>% # there are some users who took a trial twice
+  slice(which.min(product_start_date)) %>% arrange(desc(count)) 
+
+renewal_list$next_product <- ifelse(is.na(renewal_list$next_product), "No Conversion", renewal_list$next_product)
+
+renewal_list_final <- renewal_list %>%
+  group_by(optimizely_variations_name, product_arrangement_type, next_product) %>%
+  summarise(trial_next_users = n_distinct(user_guid)) %>% 
+  ungroup() %>%
+  group_by(optimizely_variations_name) %>%
+  mutate(tot_users = sum(trial_next_users)) %>% ungroup() %>%
+  mutate(perc_conversion = round((trial_next_users/tot_users)*100, 1)) %>% arrange(optimizely_variations_name, desc(trial_next_users))
+
+renewal_list_final$next_product <- ifelse(is.na(renewal_list_final$next_product), "No Conversion", renewal_list_final$next_product)
+
+# for visualising only top labels
+top_labels <- renewal_list_final %>%
+  group_by(optimizely_variations_name) %>%
+  top_n(2, perc_conversion) %>%
+  ungroup()
+
+ggplot(renewal_list_final, aes(optimizely_variations_name, perc_conversion, fill = next_product)) +
+  geom_col(position= "stack") +
+  labs(title = "Trial renewal by next_product",
+       x = element_blank()) +
+  geom_text(data = top_labels, aes(label = paste0(perc_conversion, "%")), 
+            position = position_stack(vjust = 0.5))
+```
+
+
+Renewal rates for different roll ons (annuals and standard) are proven to be more effective than Premium. However, volumes across those different roll ons are too marginal to make a difference at scale. 
+
+```{r, message = FALSE, warning = FALSE}
+trial_renewal_volumes <- renewal_list %>%
+  inner_join(trial_product_list %>% mutate(user_guid = user_guid_cv), by =  "user_guid", suffix = c("_renewal", "_product")) %>%
+  group_by(optimizely_variations_name_renewal, product_arrangement_type, next_product, trial_name) %>%
+  summarise( users = n_distinct(user_guid)) %>% 
+  ungroup() %>% 
+  arrange(optimizely_variations_name_renewal, desc(users)) %>%
+  #filter(#optimizely_variations_name_renewal == "Variation_1",
+   #      trial_name %in% c("Premium Annual", "Standard Annual")) %>%
+  group_by(optimizely_variations_name_renewal, trial_name) %>%
+  mutate(trials = sum(users)) %>%
+  ungroup() %>%
+  filter(next_product %in% c("No Conversion", "B2C Trial Conversion")) %>%
+  mutate(perc_renewal = round(users/trials*100,0)) %>%
+  filter(next_product == "B2C Trial Conversion")
+
+#merge renewal list with trial product to check on renewal
+
+renewal_list_trials <- renewal_list %>%
+  inner_join(trial_product_list %>% mutate(user_guid = user_guid_cv), by =  "user_guid", suffix = c("_renewal", "_product")) %>%
+  group_by(optimizely_variations_name_renewal, product_arrangement_type, next_product, trial_name) %>%
+  summarise( users = n_distinct(user_guid)) %>% 
+  ungroup() %>% 
+  arrange(optimizely_variations_name_renewal, desc(users)) %>%
+  #filter(#optimizely_variations_name_renewal == "Variation_1",
+   #      trial_name %in% c("Premium Annual", "Standard Annual")) %>%
+  group_by(optimizely_variations_name_renewal, trial_name) %>%
+  mutate(trials = sum(users)) %>%
+  ungroup() %>%
+  filter(next_product %in% c("No Conversion", "B2C Trial Conversion")) %>%
+  mutate(perc_renewal = round(users/trials*100,0)) %>%
+  pivot_wider(names_from = next_product, values_from = perc_renewal) %>%
+  select(-trials, -product_arrangement_type, -users) %>%
+  group_by(optimizely_variations_name_renewal, trial_name) %>%
+  summarize_all(sum, na.rm = T) %>% 
+  ungroup()
+
+#renaming column to avoid spaces
+  colnames(renewal_list_trials)[colnames(renewal_list_trials) == "B2C Trial Conversion"] <- "b2c_trial_conversion_rate"
+
+
+  ggplot(renewal_list_trials, aes(optimizely_variations_name_renewal,b2c_trial_conversion_rate, fill = trial_name)) +
+  geom_col(position = "dodge") +
+  labs(title = "Trial conversion rate by trial type",
+       x = element_blank()) +
+  geom_text(aes(label = paste0(b2c_trial_conversion_rate, "%")), position=position_dodge(width=1))
+```
+
